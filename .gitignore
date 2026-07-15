@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.tiff
+*.tif
+*.zip
+*.db
+.env
