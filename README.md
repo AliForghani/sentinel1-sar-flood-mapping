@@ -2,7 +2,7 @@
 
 > End-to-end Sentinel-1 SAR flood mapping — from scene discovery to georeferenced flood mask.
 
-Built with Python and Streamlit. Search for radar scenes via the Alaska Satellite Facility API, register pre/post-flood images with SIFT+RANSAC, detect flooded pixels from backscatter change, and export analysis-ready GeoTIFFs.
+Built with Python and Streamlit. Search for radar scenes via the Alaska Satellite Facility API, align pre/post-flood images on a shared grid and fine-register them with SIFT+RANSAC (or phase correlation), detect flooded pixels from backscatter change, and export analysis-ready GeoTIFFs.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue) ![Streamlit](https://img.shields.io/badge/Streamlit-1.29+-red) ![Rasterio](https://img.shields.io/badge/Rasterio-1.3+-green) ![License](https://img.shields.io/badge/License-MIT-lightgrey)
 
@@ -132,42 +132,96 @@ SAR images appear grainy due to coherent interference in the radar signal. This 
 
 Registration is a two-stage process in this pipeline.
 
-**Stage 1 — Coarse alignment via GCPs**
+**Stage 1 — Georeferencing (coarse alignment) via GCPs**
 
-Sentinel-1 GRD measurement TIFFs do not carry a standard affine geotransform. Instead, georeferencing is encoded as ~210 Ground Control Points (GCPs) scattered across the image — each GCP ties a pixel (row, col) to a geographic coordinate (lon, lat). `rasterio.vrt.WarpedVRT` reads these GCPs and fits a polynomial warp, resampling the image onto a regular EPSG:4326 grid. This gives both scenes a common coordinate frame and makes AOI clipping possible. For same-orbit pairs, this stage alone achieves sub-pixel alignment in most cases.
+Sentinel-1 GRD measurement TIFFs do not carry a standard affine geotransform. Instead, they include a sparse grid of ~210 Ground Control Points (GCPs) — roughly 21 across × 10 down the image. Each GCP ties one pixel (row, col) to a geographic coordinate (lon, lat); the positions of all other pixels are interpolated between them.
 
-**Stage 2 — Fine registration via feature matching + homography**
+These GCPs are not surveyed ground points. ESA's processor computes them from the satellite's orbit and timing, projected onto the Earth ellipsoid with only a coarse terrain height. The same grid is also listed in the product's `annotation/*.xml` file (`<geolocationGrid>`).
 
-Residual misalignment remains due to slight orbit deviations and terrain-induced distortions (SAR images are range-projected, not map-projected, so elevation causes pixel displacement). This is corrected with a classical CV pipeline:
+`rasterio.vrt.WarpedVRT` fits a polynomial through each scene's GCPs and resamples it **directly onto one shared AOI grid**:
 
-1. **SIFT keypoints** — Scale-Invariant Feature Transform detects stable interest points at multiple scales. SAR images are first normalized to uint8 to meet SIFT's input requirement.
-2. **Lowe's ratio test** — for each keypoint match, the distance to the best match must be < 0.75 × the distance to the second-best. This filters out ambiguous matches before RANSAC.
-3. **BFMatcher (L2)** — brute-force nearest-neighbor matching in descriptor space. Used over FLANN here because the dataset is small enough that exact matching is fast.
-4. **RANSAC homography** — `cv2.findHomography(..., cv2.RANSAC, 4.0)` fits a 3×3 projective transformation to the inlier matches. RANSAC iteratively samples 4-point minimal sets and keeps the model with the most inliers within a 4-pixel reprojection threshold. The result is robust to the ~30–50% outlier rate typical in SAR feature matching.
-5. **`cv2.warpPerspective`** — applies the homography to the pre-flood image, warping it into the coordinate frame of the post-flood image.
+- **Extent** — the bounding box of the AOI.
+- **Pixel size** — the post-flood scene's native resolution.
+- **CRS** — lon/lat (EPSG:4326).
 
-**Why homography, not just translation?**
+Because both scenes are warped onto the *same* grid, the two arrays have identical size, and pixel (i, j) has the same map coordinate (lon, lat) in both. Whether it also shows the same **ground feature** in both depends on how accurate each scene's GCPs are — that is what Stage 2 checks and corrects.
 
-A pure translation assumes the two images are identical except for a shift. A homography is a full projective transform (8 degrees of freedom) that also handles rotation, scale, and perspective distortion — necessary because even same-orbit SAR acquisitions have small orbit deviations that introduce non-uniform spatial offsets across the image.
+Nodata is handled explicitly: GRD border pixels (value 0) and pixels outside the AOI polygon become NaN, and are excluded from smoothing, registration, flood detection and the flood percentage.
+
+Each scene is still placed on the map **independently** — using its own GCPs — so a feature (e.g. a road crossing) can land a pixel or so apart in the two images:
+
+- **Small orbit and timing differences** between the two acquisitions, inherited through the GCPs.
+- **Uncorrected terrain** — the GCPs use only a coarse terrain height, so elevated areas are slightly displaced. For same-orbit pairs the displacement is nearly identical in both images, so it largely cancels out in change detection.
+
+**Stage 2 — Fine registration (image-to-image)**
+
+Stage 2 compares the two images directly and corrects any small residual misalignment. For same-orbit pairs on a shared grid this is typically well under 1–2 pixels. Two methods are available in the app:
+
+| Method | Model | Role |
+|---|---|---|
+| **SIFT + RANSAC homography** (default) | Projective transform (8 parameters) | Automatic feature-based matching — the classical computer-vision approach |
+| **Phase correlation** | Shift only (2 parameters) | Simpler baseline — useful to compare against SIFT |
+
+**In short:**
+
+- **SIFT + RANSAC (feature-based)** — finds distinctive points in each image (road crossings, field corners) and gives each a "fingerprint". Fingerprints are matched between the images, ambiguous matches are dropped, and RANSAC fits a transform to the matches that agree with each other — ignoring the wrong ones. The pre-flood image is then warped with that transform.
+- **Phase correlation (whole-image)** — instead of individual points, compares the two images in the frequency domain, where a shift in space shows up as a phase difference. The correlation peak gives the offset directly, with sub-pixel precision.
+- **Trade-off** — SIFT is more flexible (it can also model rotation and scale) but can match speckle noise and needs textured areas. Phase correlation is simpler, faster and more robust to noise, but handles shifts only — which is usually all a same-orbit pair needs. When both report a similar shift, the result can be trusted.
+
+**Why not just trust the GCPs?** They are computed from orbit and timing, not measured on the ground, so they are accurate to about a pixel. Change detection compares pixel by pixel, so even a one-pixel misalignment creates false "changes" along every edge — roads, field boundaries, riverbanks.
+
+Both methods share the same safety rules: the estimated transform is applied **only if it passes sanity checks** (otherwise the pre-flood image is left as is and a warning explains why), and areas brought in from outside the image become NaN (nodata) rather than zero, so they cannot be mistaken for flood.
+
+**Method A — SIFT + RANSAC homography (automatic feature matching)**
+
+1. **Keypoint mask** — keypoints are only searched for well inside valid data (the valid area shrunk by 7 px). The edge between image and nodata is a strong artificial feature that would otherwise dominate the matching.
+2. **SIFT keypoints** — Scale-Invariant Feature Transform detects distinctive points (corners, edges, bright structures) at multiple scales and describes each with a 128-number descriptor. Images are first stretched to 0–255 (2nd–98th percentile of valid pixels), since SIFT needs 8-bit input.
+3. **BFMatcher (L2)** — brute-force nearest-neighbour matching of descriptors; for each pre-flood keypoint, the two closest post-flood keypoints are returned.
+4. **Lowe's ratio test** — keep a match only if the best candidate is clearly better than the second-best (distance < 0.75 × second-best by default). This removes ambiguous matches.
+5. **RANSAC homography** — `cv2.findHomography(..., cv2.RANSAC, threshold)` repeatedly fits a 3×3 transform to random sets of 4 matches and keeps the one that agrees with the most matches (inliers) within the pixel threshold (default 4 px). This makes the fit robust to wrong matches.
+6. **Sanity checks** — the homography is applied only if it has enough inliers (default ≥ 20), a shift below the *max accepted shift* (default 3 px), and a rotation below 1°.
+7. **`cv2.warpPerspective`** — resamples the pre-flood image with the accepted homography.
+
+*Things to watch with SIFT on SAR:*
+
+- **Speckle** — speckle is random between acquisitions, so some keypoints land on noise. The 7×7 smoothing and Lowe's ratio test reduce this; RANSAC rejects most of the rest.
+- **Flat or water-dominated AOIs** — few distinctive structures means few reliable matches. Prefer AOIs that include roads, field edges, or built-up areas.
+- **More flexibility than needed** — a homography can also model rotation, scale and perspective, which same-orbit pairs barely have. That extra freedom can fit noise; the rotation and shift checks guard against it.
+
+**Method B — Phase correlation (shift only)**
+
+1. **Phase correlation** — `skimage.registration.phase_cross_correlation` compares the two images in the frequency domain and finds the shift that best lines them up, with sub-pixel precision (1/10 pixel). It uses the whole image rather than individual keypoints, so it is robust to speckle and needs no tuning.
+2. **Sanity check** — the shift is applied only if it is below the *max accepted shift* (default 3 px).
+3. **Apply** — the pre-flood image is shifted with bilinear interpolation.
+
+**Comparing the two** — on a good same-orbit pair, both methods should report a similar small shift (within a fraction of a pixel). If they disagree noticeably, SIFT has probably locked onto noise or changed areas — check its inlier count and rotation.
+
+**What Stage 2 cannot fix**
+
+- **Terrain displacement** — it varies locally with elevation, so no single global transform can correct it. If it matters (mountainous AOIs, different orbits), use proper terrain correction with a DEM (e.g. ESA SNAP or `pyroSAR`) instead of GCP warping.
+- **Large changes** — flooding changes the image itself. Both methods rely on the unchanged parts of the AOI; if most of the AOI is flooded, estimates become less reliable (and are more likely to be rejected by the sanity checks).
 
 **Quality metrics**
 
-| Metric | What it means | Expected value |
-|---|---|---|
-| RANSAC inliers | Matches consistent with the estimated homography | > 20 for reliable registration |
-| Inlier ratio | Fraction of matches kept after RANSAC | > 0.3; low ratio suggests poor texture |
-| Shift X / Y | Pixel translation component of the homography | Near 0 for same-orbit pairs |
-| Rotation | Rotation angle of the homography | < 1° for same-orbit pairs; > 2° suggests a problem |
+| Metric | Method | What it means | Expected value |
+|---|---|---|---|
+| Shift X / Y | Both | Estimated residual offset of pre-flood relative to post-flood | < 1–2 px for same-orbit pairs |
+| Matches | SIFT | Keypoint matches that passed Lowe's ratio test | Tens to hundreds |
+| RANSAC inliers | SIFT | Matches consistent with the fitted homography | ≥ 20 for reliable registration |
+| Inlier ratio | SIFT | Fraction of matches kept by RANSAC | Higher is better; very low means mostly wrong matches |
+| Rotation | SIFT | Rotation in the homography | ~0° for same-orbit pairs; > 1° is rejected |
+| Correlation error | Phase | Phase-correlation error (0 = perfect match, 1 = no match) | Lower is better; flooding itself raises it |
+| Applied | Both | Whether the transform passed the sanity checks | Yes for a normal same-orbit pair |
 
 ---
 
 ## Output Files
 
-All outputs are georeferenced (EPSG:4326) and open directly in QGIS or ArcGIS.
+All outputs share the same AOI grid (EPSG:4326), are deflate-compressed, and open directly in QGIS or ArcGIS.
 
 | File | Type | Description |
 |---|---|---|
-| `pre_flood_vv_db.tif` | float32 | Pre-flood VV backscatter in dB |
-| `pre_flood_registered_db.tif` | float32 | Pre-flood aligned to post-flood geometry |
-| `post_flood_vv_db.tif` | float32 | Post-flood VV backscatter in dB |
-| `flood_mask.tif` | uint8 | Binary flood mask (1 = flood, 0 = no flood) |
+| `pre_flood_vv_db.tif` | float32 | Pre-flood VV backscatter in dB, on the shared grid (nodata = NaN) |
+| `pre_flood_registered_db.tif` | float32 | Pre-flood after the Stage 2 shift (identical to the above if no shift was applied) |
+| `post_flood_vv_db.tif` | float32 | Post-flood VV backscatter in dB (nodata = NaN) |
+| `flood_mask.tif` | uint8 | Flood mask (1 = flood, 0 = no flood, 255 = nodata) |

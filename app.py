@@ -10,7 +10,12 @@ import numpy as np
 import cv2
 import scipy.ndimage
 import rasterio
+from rasterio.crs import CRS
+from rasterio.enums import Resampling
+from rasterio.features import geometry_mask
+from rasterio.transform import from_origin
 from rasterio.vrt import WarpedVRT
+from skimage.registration import phase_cross_correlation
 import matplotlib.pyplot as plt
 import io
 import math
@@ -19,8 +24,6 @@ import json
 from shapely.geometry import mapping
 from shapely import wkt as shapely_wkt
 from shapely.ops import transform as shp_transform
-from rasterio.mask import mask as rio_mask
-from rasterio.warp import transform_geom
 from pyproj import Transformer
 
 def aoi_area_km2(wkt: str) -> float:
@@ -42,75 +45,177 @@ st.caption(
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def _read_and_clip(src, aoi_wkt):
-    if aoi_wkt and src.crs is not None:
-        geom_wgs84 = mapping(shapely_wkt.loads(aoi_wkt))
-        geom_proj = transform_geom("EPSG:4326", src.crs, geom_wgs84)
-        arr, clip_transform = rio_mask(src, [geom_proj], crop=True, nodata=0)
-        arr = arr[0].astype(np.float32)
-    else:
-        arr = src.read(1).astype(np.float32)
-        clip_transform = src.transform
-    return arr, clip_transform
+def aoi_grid(post_path, aoi_wkt) -> dict:
+    """Common EPSG:4326 pixel grid covering the AOI, at the post-flood scene's native resolution.
+
+    Both scenes are warped onto this exact grid, so pixel (i, j) is the same ground
+    location in both — no image-to-image warping is needed afterwards.
+    """
+    with rasterio.open(post_path) as src, WarpedVRT(src) as vrt:
+        res_x, res_y = vrt.res
+    minx, miny, maxx, maxy = shapely_wkt.loads(aoi_wkt).bounds
+    width = max(1, math.ceil((maxx - minx) / res_x))
+    height = max(1, math.ceil((maxy - miny) / res_y))
+    return {
+        "crs": CRS.from_epsg(4326),
+        "transform": from_origin(minx, maxy, res_x, res_y),
+        "width": width,
+        "height": height,
+    }
 
 
-def load_sar_db(path, aoi_wkt=None) -> tuple[np.ndarray, dict]:
+def nan_uniform_filter(arr, size=7):
+    """Mean filter that ignores NaN (nodata) pixels instead of smearing them into valid ones."""
+    valid = np.isfinite(arr)
+    num = scipy.ndimage.uniform_filter(np.where(valid, arr, 0).astype(np.float32), size=size)
+    den = scipy.ndimage.uniform_filter(valid.astype(np.float32), size=size)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = num / den
+    out[~valid] = np.nan
+    return out
+
+
+def load_sar_db(path, grid, aoi_wkt) -> np.ndarray:
+    """Read a GRD VV TIFF onto `grid` and return dB values, NaN where there is no data."""
     with rasterio.open(path) as src:
         # Sentinel-1 GRD TIFFs store georeferencing as GCPs, not affine.
-        # WarpedVRT converts them to a regular EPSG:4326 grid on the fly.
-        with WarpedVRT(src) as vrt:
-            arr, clip_transform = _read_and_clip(vrt, aoi_wkt)
-            meta = vrt.meta.copy()
-    meta.update({
-        "count": 1,
-        "dtype": "float32",
-        "height": arr.shape[0],
-        "width": arr.shape[1],
-        "transform": clip_transform,
-    })
-    arr = np.clip(arr, 1e-6, None)
-    arr_db = 10 * np.log10(arr)
-    arr_db = scipy.ndimage.uniform_filter(arr_db, size=7)
-    return arr_db, meta
+        # WarpedVRT fits the GCPs and resamples directly onto the shared AOI grid.
+        with WarpedVRT(
+            src,
+            crs=grid["crs"], transform=grid["transform"],
+            width=grid["width"], height=grid["height"],
+            src_nodata=0, nodata=0,  # GRD border pixels are 0
+            resampling=Resampling.bilinear,
+        ) as vrt:
+            dn = vrt.read(1).astype(np.float32)
+    inside_aoi = geometry_mask(
+        [mapping(shapely_wkt.loads(aoi_wkt))],
+        out_shape=dn.shape, transform=grid["transform"], invert=True,
+    )
+    valid = (dn > 0) & inside_aoi
+    arr_db = np.full(dn.shape, np.nan, dtype=np.float32)
+    arr_db[valid] = 10 * np.log10(dn[valid])
+    return nan_uniform_filter(arr_db, size=7)
+
+
+def register_phase(pre_db, post_db, max_shift_px=3.0, upsample_factor=10):
+    """Estimate the residual sub-pixel shift between two images on the same grid.
+
+    Uses phase correlation (translation only). The shift is applied only if it is
+    smaller than `max_shift_px`; a larger value means the estimate is unreliable
+    (or the georeferencing itself is wrong), so the pre-flood image is left as is.
+
+    Returns (pre_registered, info).
+    """
+    info = {"dx": 0.0, "dy": 0.0, "error": float("nan"), "applied": False, "reason": ""}
+    common = np.isfinite(pre_db) & np.isfinite(post_db)
+    if common.sum() < 1000:
+        info["reason"] = "too little overlap between the two images"
+        return pre_db, info
+
+    # Phase correlation needs finite input: fill nodata with each image's mean.
+    pre_f = np.where(np.isfinite(pre_db), pre_db, np.nanmean(pre_db[common]))
+    post_f = np.where(np.isfinite(post_db), post_db, np.nanmean(post_db[common]))
+
+    shift, error, _ = phase_cross_correlation(
+        post_f, pre_f, upsample_factor=upsample_factor
+    )
+    info.update(dy=float(shift[0]), dx=float(shift[1]), error=float(error))
+
+    if math.hypot(info["dx"], info["dy"]) > max_shift_px:
+        info["reason"] = f"estimated shift exceeds {max_shift_px} px"
+        return pre_db, info
+
+    # cval=NaN: pixels shifted in from outside the image are marked as nodata.
+    pre_registered = scipy.ndimage.shift(pre_db, (info["dy"], info["dx"]), order=1, cval=np.nan)
+    info["applied"] = True
+    return pre_registered.astype(np.float32), info
 
 
 def to_uint8(arr_db: np.ndarray) -> np.ndarray:
-    return cv2.normalize(arr_db, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    """Stretch valid dB values (2nd–98th percentile) to 0–255 for SIFT; nodata becomes 0."""
+    valid = np.isfinite(arr_db)
+    lo, hi = np.percentile(arr_db[valid], [2, 98])
+    out = np.zeros(arr_db.shape, dtype=np.uint8)
+    out[valid] = (np.clip((arr_db[valid] - lo) / (hi - lo + 1e-6), 0, 1) * 255).astype(np.uint8)
+    return out
 
 
-def register_sar(pre_db, post_db, nfeatures=5000, lowe_ratio=0.75, ransac_thresh=4.0):
-    pre_u8, post_u8 = to_uint8(pre_db), to_uint8(post_db)
+def register_sift(pre_db, post_db, nfeatures=5000, lowe_ratio=0.75, ransac_thresh=4.0,
+                  min_inliers=20, max_shift_px=3.0, max_rotation_deg=1.0):
+    """Align pre-flood to post-flood with SIFT keypoints + RANSAC homography.
+
+    The homography is applied only if it passes sanity checks (enough inliers,
+    small shift, small rotation); otherwise the pre-flood image is left as is.
+
+    Returns (pre_registered, info).
+    """
+    info = {"dx": 0.0, "dy": 0.0, "matches": 0, "inliers": 0, "inlier_ratio": 0.0,
+            "rotation": 0.0, "applied": False, "reason": ""}
+    pre_valid, post_valid = np.isfinite(pre_db), np.isfinite(post_db)
+    if pre_valid.sum() < 1000 or post_valid.sum() < 1000:
+        info["reason"] = "too few valid pixels"
+        return pre_db, info
+
+    # Only detect keypoints well inside valid data — the edge between image and
+    # nodata is a strong artificial feature that would otherwise dominate matching.
+    kernel = np.ones((15, 15), np.uint8)
+    pre_kp_mask = cv2.erode(pre_valid.astype(np.uint8) * 255, kernel)
+    post_kp_mask = cv2.erode(post_valid.astype(np.uint8) * 255, kernel)
+
     sift = cv2.SIFT_create(nfeatures=nfeatures)
-    kp1, des1 = sift.detectAndCompute(pre_u8, None)
-    kp2, des2 = sift.detectAndCompute(post_u8, None)
-
+    kp1, des1 = sift.detectAndCompute(to_uint8(pre_db), pre_kp_mask)
+    kp2, des2 = sift.detectAndCompute(to_uint8(post_db), post_kp_mask)
     if des1 is None or des2 is None or len(kp1) < 4 or len(kp2) < 4:
-        return pre_db, None, 0, 0.0
+        info["reason"] = "too few keypoints detected"
+        return pre_db, info
 
-    matcher = cv2.BFMatcher(cv2.NORM_L2)
-    pairs = matcher.knnMatch(des1, des2, k=2)
-    good = [m for m, n in pairs if len((m, n)) == 2 and m.distance < lowe_ratio * n.distance]
-
+    # For each pre-flood keypoint, find the 2 nearest post-flood keypoints,
+    # then keep it only if the best is clearly better than the second (Lowe's ratio test).
+    pairs = cv2.BFMatcher(cv2.NORM_L2).knnMatch(des1, des2, k=2)
+    good = [p[0] for p in pairs if len(p) == 2 and p[0].distance < lowe_ratio * p[1].distance]
+    info["matches"] = len(good)
     if len(good) < 4:
-        return pre_db, None, len(good), 0.0
+        info["reason"] = "too few matches after Lowe's ratio test"
+        return pre_db, info
 
     src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
     dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-    H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, ransac_thresh)
-
+    H, inlier_mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, ransac_thresh)
     if H is None:
-        return pre_db, None, len(good), 0.0
+        info["reason"] = "RANSAC could not fit a homography"
+        return pre_db, info
 
-    inliers = int(mask.sum())
-    ratio = inliers / len(good)
+    info["inliers"] = int(inlier_mask.sum())
+    info["inlier_ratio"] = info["inliers"] / len(good)
+    info["dx"], info["dy"] = float(H[0, 2]), float(H[1, 2])
+    info["rotation"] = math.degrees(math.atan2(H[1, 0], H[0, 0]))
+
+    if info["inliers"] < min_inliers:
+        info["reason"] = f"only {info['inliers']} inliers (need ≥ {min_inliers})"
+    elif math.hypot(info["dx"], info["dy"]) > max_shift_px:
+        info["reason"] = f"estimated shift exceeds {max_shift_px} px"
+    elif abs(info["rotation"]) > max_rotation_deg:
+        info["reason"] = f"estimated rotation exceeds {max_rotation_deg}°"
+    if info["reason"]:
+        return pre_db, info
+
+    # borderValue=NaN: areas warped in from outside the image are marked as nodata.
     h, w = post_db.shape
-    pre_registered = cv2.warpPerspective(pre_db, H, (w, h))
-    return pre_registered, H, inliers, ratio
+    pre_registered = cv2.warpPerspective(
+        pre_db.astype(np.float32), H, (w, h),
+        flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=float("nan"),
+    )
+    info["applied"] = True
+    return pre_registered, info
 
 
 def detect_flood(pre_db, post_db, threshold_db):
+    """Return the dB difference and a mask: 1 = flood, 0 = no flood, 255 = nodata."""
     diff = post_db - pre_db
-    flood_mask = (diff < threshold_db).astype(np.uint8)
+    valid = np.isfinite(diff)
+    flood_mask = np.full(diff.shape, 255, dtype=np.uint8)
+    flood_mask[valid] = (diff[valid] < threshold_db).astype(np.uint8)
     return diff, flood_mask
 
 
@@ -122,10 +227,10 @@ def fig_to_bytes(fig):
 
 
 def plot_sar(arr_db, title, vmin=None, vmax=None):
-    # Skip nodata border pixels (zeros clip to ~-60 dB) before percentile calc
-    valid = arr_db[np.isfinite(arr_db) & (arr_db > -55)]
+    # Nodata is NaN, so percentiles are computed over valid pixels only
+    valid = arr_db[np.isfinite(arr_db)]
     if valid.size == 0:
-        valid = arr_db[np.isfinite(arr_db)]
+        valid = np.array([0.0])
     if vmin is None:
         vmin = float(np.percentile(valid, 5))
     if vmax is None:
@@ -139,7 +244,9 @@ def plot_sar(arr_db, title, vmin=None, vmax=None):
 
 def plot_flood_overlay(post_db, flood_mask):
     fig, ax = plt.subplots(figsize=(5, 4))
-    ax.imshow(post_db, cmap="gray", vmin=-25, vmax=0)
+    valid = post_db[np.isfinite(post_db)]
+    vmin, vmax = (np.percentile(valid, [5, 95]) if valid.size else (None, None))
+    ax.imshow(post_db, cmap="gray", vmin=vmin, vmax=vmax)
     overlay = np.zeros((*flood_mask.shape, 4), dtype=np.float32)
     overlay[flood_mask == 1] = [0, 0.5, 1, 0.6]   # blue = flood
     ax.imshow(overlay)
@@ -434,63 +541,105 @@ if "selected_post" in st.session_state and "selected_pre" in st.session_state:
             ),
         )
 
+        reg_method = st.radio(
+            "Fine registration method (Stage 2)",
+            ["SIFT + RANSAC homography", "Phase correlation (shift only)"],
+            horizontal=True,
+            help=(
+                "SIFT + RANSAC: automatic feature matching — detects keypoints in both images, "
+                "matches them, and fits a homography.\n\n"
+                "Phase correlation: estimates a sub-pixel shift from the whole image. "
+                "Simpler and more stable baseline — useful to compare against SIFT."
+            ),
+        )
+
         with st.expander("Advanced registration settings", expanded=False):
-            nfeatures = st.slider(
-                "Max SIFT keypoints", 1000, 20000, 5000, 1000,
-                help="Maximum keypoints SIFT detects per image. Increase if registration fails with too few inliers.",
+            max_shift_px = st.slider(
+                "Max accepted shift (px)", 0.5, 10.0, 3.0, 0.5,
+                help=(
+                    "Both scenes are already on the same pixel grid, so the remaining offset should be small. "
+                    "A larger estimated shift is treated as unreliable and not applied."
+                ),
             )
-            lowe_ratio = st.slider(
-                "Lowe's ratio", 0.5, 0.95, 0.75, 0.05,
-                help="Match filter: keep a match only if its distance is < ratio × next-best distance. Lower = stricter.",
-            )
-            ransac_thresh = st.slider(
-                "RANSAC threshold (px)", 1.0, 10.0, 4.0, 0.5,
-                help="Max reprojection error (pixels) for a match to be counted as an inlier. Increase for large misalignments.",
-            )
+            if reg_method.startswith("SIFT"):
+                nfeatures = st.slider(
+                    "Max SIFT keypoints", 1000, 20000, 5000, 1000,
+                    help="Maximum keypoints SIFT detects per image. Increase if too few inliers are found.",
+                )
+                lowe_ratio = st.slider(
+                    "Lowe's ratio", 0.5, 0.95, 0.75, 0.05,
+                    help="Keep a match only if its distance is < ratio × next-best distance. Lower = stricter.",
+                )
+                ransac_thresh = st.slider(
+                    "RANSAC threshold (px)", 1.0, 10.0, 4.0, 0.5,
+                    help="Max reprojection error (pixels) for a match to count as an inlier.",
+                )
+                min_inliers = st.slider(
+                    "Min inliers to accept", 4, 100, 20, 1,
+                    help="The homography is applied only if at least this many matches agree with it.",
+                )
 
         if st.button("Run Analysis", type="primary"):
-            with st.spinner("Loading and converting to dB..."):
-                pre_db,  pre_meta  = load_sar_db(pre_path,  aoi_wkt)
-                post_db, post_meta = load_sar_db(post_path, aoi_wkt)
+            with st.spinner("Warping both scenes onto a common AOI grid and converting to dB..."):
+                grid = aoi_grid(post_path, aoi_wkt)
+                pre_db = load_sar_db(pre_path, grid, aoi_wkt)
+                post_db = load_sar_db(post_path, grid, aoi_wkt)
 
-            with st.spinner("Registering pre-flood image to post-flood..."):
-                pre_registered, H, inliers, ratio = register_sar(
-                    pre_db, post_db, nfeatures=nfeatures,
-                    lowe_ratio=lowe_ratio, ransac_thresh=ransac_thresh,
-                )
+            if reg_method.startswith("SIFT"):
+                with st.spinner("Registering with SIFT + RANSAC..."):
+                    pre_registered, reg = register_sift(
+                        pre_db, post_db, nfeatures=nfeatures, lowe_ratio=lowe_ratio,
+                        ransac_thresh=ransac_thresh, min_inliers=min_inliers,
+                        max_shift_px=max_shift_px,
+                    )
+            else:
+                with st.spinner("Estimating residual shift (phase correlation)..."):
+                    pre_registered, reg = register_phase(
+                        pre_db, post_db, max_shift_px=max_shift_px,
+                    )
 
             with st.spinner("Detecting flood pixels..."):
                 diff, flood_mask = detect_flood(pre_registered, post_db, threshold_db)
 
             # registration metrics
-            flood_pct = 100 * flood_mask.sum() / flood_mask.size
-            c1, c2, c3, c4, c5, c6 = st.columns(6)
-            with c1:
-                st.metric("RANSAC inliers", inliers,
-                          help="Number of feature matches that fit the estimated homography within 4 px.")
-            with c2:
-                st.metric("Inlier ratio", f"{ratio:.2f}",
-                          help="Fraction of matches kept after RANSAC. >0.5 is good; <0.2 suggests poor overlap.")
-            with c3:
-                st.metric("Flooded pixels", f"{flood_pct:.1f}%",
-                          help="Percentage of AOI pixels flagged as flooded at the chosen threshold.")
-            if H is not None:
-                tx = H[0, 2]
-                ty = H[1, 2]
-                scale = math.sqrt(H[0, 0] ** 2 + H[1, 0] ** 2)
-                angle = math.degrees(math.atan2(H[1, 0], H[0, 0]))
-                with c4:
-                    st.metric("Shift X", f"{tx:.1f} px",
-                              help="Horizontal pixel offset applied to the pre-flood image to align it with post-flood.")
-                with c5:
-                    st.metric("Shift Y", f"{ty:.1f} px",
-                              help="Vertical pixel offset. Near 0 for same-orbit scenes.")
-                with c6:
-                    st.metric("Rotation", f"{angle:.2f}°",
-                              help="Rotation angle of the transform. Should be <1° for same-orbit SAR pairs; larger values indicate poor registration.")
+            n_valid = int((flood_mask != 255).sum())
+            flood_pct = 100 * (flood_mask == 1).sum() / n_valid if n_valid else 0.0
+            metrics = [
+                ("Shift X", f"{reg['dx']:.2f} px",
+                 "Estimated horizontal offset of the pre-flood image relative to post-flood."),
+                ("Shift Y", f"{reg['dy']:.2f} px",
+                 "Estimated vertical offset of the pre-flood image relative to post-flood."),
+            ]
+            if reg_method.startswith("SIFT"):
+                metrics += [
+                    ("Matches", reg["matches"], "Keypoint matches that passed Lowe's ratio test."),
+                    ("RANSAC inliers", reg["inliers"],
+                     "Matches consistent with the fitted homography."),
+                    ("Inlier ratio", f"{reg['inlier_ratio']:.2f}",
+                     "Fraction of matches kept by RANSAC. Low values mean many wrong matches."),
+                    ("Rotation", f"{reg['rotation']:.2f}°",
+                     "Rotation in the homography. Should be ~0° for same-orbit pairs."),
+                ]
+            else:
+                metrics += [
+                    ("Correlation error", f"{reg['error']:.2f}",
+                     "Phase-correlation error (0 = perfect match, 1 = no match). Flooding itself raises it."),
+                ]
+            metrics += [
+                ("Applied", "Yes" if reg["applied"] else "No",
+                 "Whether the estimated transform passed the sanity checks and was applied."),
+                ("Flooded pixels", f"{flood_pct:.1f}%",
+                 "Percentage of valid AOI pixels flagged as flooded at the chosen threshold."),
+            ]
+            for col, (label, value, help_text) in zip(st.columns(len(metrics)), metrics):
+                with col:
+                    st.metric(label, value, help=help_text)
 
-            if H is None:
-                st.warning("Registration failed — too few keypoints matched. Proceeding with unregistered images.")
+            if not reg["applied"]:
+                st.warning(
+                    f"Registration not applied — {reg['reason']}. "
+                    "Using the georeferenced images as is (both are already on the same grid)."
+                )
 
             # store for saving
             st.session_state["results"] = {
@@ -498,7 +647,7 @@ if "selected_post" in st.session_state and "selected_pre" in st.session_state:
                 "pre_registered": pre_registered,
                 "post_db": post_db,
                 "flood_mask": flood_mask,
-                "meta": pre_meta,
+                "grid": grid,
             }
 
             # visualise
@@ -527,30 +676,32 @@ if "selected_post" in st.session_state and "selected_pre" in st.session_state:
                     "• pre_flood_vv_db.tif — pre-flood VV in dB (float32)\n"
                     "• pre_flood_registered_db.tif — pre-flood aligned to post (float32)\n"
                     "• post_flood_vv_db.tif — post-flood VV in dB (float32)\n"
-                    "• flood_mask.tif — binary flood mask: 1=flood, 0=no flood (uint8)\n\n"
-                    "dB files carry the AOI CRS and transform — open directly in QGIS or ArcGIS."
+                    "• flood_mask.tif — flood mask: 1=flood, 0=no flood, 255=nodata (uint8)\n\n"
+                    "All four files share the same AOI grid (EPSG:4326) — open directly in QGIS or ArcGIS."
                 ),
             )
             if st.button("Save GeoTIFFs", type="secondary") and out_dir:
                 res = st.session_state["results"]
-                meta = res["meta"].copy()
+                grid = res["grid"]
                 os.makedirs(out_dir, exist_ok=True)
 
-                def _write(arr, fname, dtype):
+                def _write(arr, fname, dtype, nodata):
                     m = {
                         "driver": "GTiff",
                         "dtype": dtype,
                         "count": 1,
-                        "height": arr.shape[0],
-                        "width": arr.shape[1],
-                        "crs": meta.get("crs"),
-                        "transform": meta.get("transform"),
+                        "height": grid["height"],
+                        "width": grid["width"],
+                        "crs": grid["crs"],
+                        "transform": grid["transform"],
+                        "nodata": nodata,
+                        "compress": "deflate",
                     }
                     with rasterio.open(os.path.join(out_dir, fname), "w", **m) as dst:
                         dst.write(arr.astype(dtype), 1)
 
-                _write(res["pre_db"],        "pre_flood_vv_db.tif",       "float32")
-                _write(res["pre_registered"], "pre_flood_registered_db.tif", "float32")
-                _write(res["post_db"],       "post_flood_vv_db.tif",      "float32")
-                _write(res["flood_mask"],    "flood_mask.tif",            "uint8")
+                _write(res["pre_db"],         "pre_flood_vv_db.tif",         "float32", np.nan)
+                _write(res["pre_registered"], "pre_flood_registered_db.tif", "float32", np.nan)
+                _write(res["post_db"],        "post_flood_vv_db.tif",        "float32", np.nan)
+                _write(res["flood_mask"],     "flood_mask.tif",              "uint8",   255)
                 st.success(f"Saved 4 GeoTIFFs to: {out_dir}")
